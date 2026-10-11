@@ -16,7 +16,7 @@ description: "Run SQL on CSV files in place, using about 10x less memory than a 
       <tr><td>"Average fare by passenger count?"</td><td><strong>123</strong></td></tr>
     </table>
     </div>
-    <p>Same answers, <strong>~1,000&ndash;500,000&times; fewer tokens</strong>. Flat, regardless of file size. One command wires it into Claude.</p>
+    <p>Five questions cost about <strong>560 tokens</strong> in total, tool schema included, and that is flat regardless of file size. Against pasting the file this is a feasibility argument, not a savings figure: pasting was never an option. Against an agent that already shells out to <code>duckdb -csv</code> the token gap is small; what changes is <code>--root</code>, read-only execution, the output cap and the memory. One command wires it into Claude.</p>
   </div>
 </section>
 
@@ -27,7 +27,7 @@ description: "Run SQL on CSV files in place, using about 10x less memory than a 
     <div class="grid">
       <div class="card"><h3>About 10&times; less memory</h3><p>Counting 5 million distinct values in an 11&nbsp;GB CSV: <strong>235&nbsp;MB</strong> for csvql, 2,639&nbsp;MB for DuckDB. A plain filter over the same file holds <strong>53&nbsp;MB</strong>. Fits on the small VM sitting next to your data.</p></div>
       <div class="card"><h3>Sandboxed by a flag</h3><p><code>--root &lt;dir&gt;</code> confines every file the process can open. Paths outside it, including <code>../</code> traversal, fail with <code>PathOutsideAllowedRoot</code>. Give an agent a directory, not a filesystem.</p></div>
-      <div class="card"><h3>MCP-native</h3><p>Ships as an MCP server, wired up by <code>csvql install</code>. Agents query CSV/JSON directly; results are capped so a careless query can't flood the context.</p></div>
+      <div class="card"><h3>MCP-native</h3><p>Ships as an MCP server, wired up by <code>csvql install</code>. Agents query CSV files directly; results are capped at about 100 rows / 12&nbsp;KB so a careless query can't flood the context or pull a table out one call at a time.</p></div>
       <div class="card"><h3>Read-only</h3><p>SELECT only. No INSERT/UPDATE/DELETE/DROP exists. It cannot modify your data.</p></div>
       <div class="card"><h3>Zero ingest, zero network</h3><p>Queries the raw CSV in place via mmap. No import step, no native store to build first. No cloud, no telemetry, air-gappable, with <code>--audit</code> logging.</p></div>
       <div class="card"><h3>One 1.3&nbsp;MB binary</h3><p>Written in Zig. No runtime, no dependencies. macOS, Linux, Windows. Also on npm, PyPI, and Homebrew.</p></div>
@@ -38,17 +38,17 @@ description: "Run SQL on CSV files in place, using about 10x less memory than a 
 <section id="perf">
   <div class="wrap">
     <h2><span class="accent">Faster than DuckDB</span> on scans and joins</h2>
-    <p>NYC Taxi benchmark on DuckDB's own dataset, both engines querying the raw uncompressed CSV directly (no preload), best-of-5.</p>
+    <p>NYC Taxi benchmark on DuckDB's own dataset (csvql 2.6.0, DuckDB 1.5.5), both engines querying the raw uncompressed CSV directly (no preload), best-of-3. JOIN rows are a 2M-row synthetic fixture, best-of-5.</p>
     <div class="scroll">
     <table>
       <tr><th>File</th><th>Query</th><th>csvql</th><th>DuckDB</th><th>Speedup</th></tr>
       <tr><td>417 MB</td><td>GROUP BY</td><td><strong>0.05s</strong></td><td>0.54s</td><td><strong>~10&times;</strong></td></tr>
-      <tr><td>8 GB</td><td>GROUP BY</td><td><strong>1.31s</strong></td><td>3.55s</td><td><strong>~2.8&times;</strong></td></tr>
-      <tr><td>81 MB</td><td>JOIN</td><td><strong>0.05s</strong></td><td>2.6s</td><td><strong>~54&times;</strong></td></tr>
-      <tr><td>81 MB</td><td>JOIN SELECT *</td><td><strong>0.11s</strong></td><td>7.6s</td><td><strong>~70&times;</strong></td></tr>
+      <tr><td>8 GB</td><td>GROUP BY</td><td><strong>1.42s</strong></td><td>4.70s</td><td><strong>~3.3&times;</strong></td></tr>
+      <tr><td>56 MB</td><td>JOIN</td><td><strong>0.044s</strong></td><td>2.65s</td><td><strong>~60&times;</strong></td></tr>
+      <tr><td>56 MB</td><td>JOIN SELECT *</td><td><strong>0.088s</strong></td><td>7.83s</td><td><strong>~89&times;</strong></td></tr>
     </table>
     </div>
-    <p>Plus <strong>zero extra storage</strong>. DuckDB's comparable speed needs a 2.1&nbsp;GB native store built over ~22&nbsp;seconds first. Reproduce with <code>bench/bench_taxi.sh</code> and <code>bench/bench_all.sh --section join</code>. More on why joins and aggregates scale differently: <a href="blog/join-performance-vs-duckdb.html">the blog post</a>.</p>
+    <p>Plus <strong>zero extra storage</strong>. DuckDB's comparable speed needs a 2.1&nbsp;GB native store built over ~26&nbsp;seconds first. Reproduce with <code>bench/bench_taxi.sh</code> and <code>bench/bench_all.sh --section join</code>. More on why joins and aggregates scale differently: <a href="blog/join-performance-vs-duckdb.html">the blog post</a>.</p>
   </div>
 </section>
 
