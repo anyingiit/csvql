@@ -1,7 +1,7 @@
 ---
 layout: home
 title: "csvql: the analytical CSV query engine for AI agents"
-description: "Run SQL on CSV files in place, using about 10x less memory than a database. MCP-native so an agent can query gigabyte files for a few hundred tokens, sandboxed to a directory you choose. Single 1.3 MB Zig binary, read-only, air-gappable."
+description: "Run SQL on CSV files in place, using 3 to 11x less memory than DuckDB on the same raw CSV. MCP-native so an agent can query gigabyte files for a few hundred tokens, sandboxed to a directory you choose. Single 1.3 MB Zig binary, read-only, air-gappable."
 ---
 
 <section id="tokens">
@@ -25,7 +25,7 @@ description: "Run SQL on CSV files in place, using about 10x less memory than a 
     <h2>Why <span class="accent">csvql</span></h2>
     <p class="quote">A database is something you load your data into. csvql is a query you run on the data where it already lives.</p>
     <div class="grid">
-      <div class="card"><h3>About 10&times; less memory</h3><p>Counting 5 million distinct values in an 11&nbsp;GB CSV: <strong>235&nbsp;MB</strong> for csvql, 2,639&nbsp;MB for DuckDB. A plain filter over the same file holds <strong>53&nbsp;MB</strong>. Fits on the small VM sitting next to your data.</p></div>
+      <div class="card"><h3>3 to 11&times; less memory</h3><p>Counting 5 million distinct values in an 11&nbsp;GB CSV: <strong>235&nbsp;MB</strong> for csvql, 2,639&nbsp;MB for DuckDB. A plain filter over the same file holds <strong>53&nbsp;MB</strong> against 268. A <code>GROUP BY</code> on an 8&nbsp;GB file, 74 against 367. Fits on the small VM sitting next to your data.</p></div>
       <div class="card"><h3>Sandboxed by a flag</h3><p><code>--root &lt;dir&gt;</code> confines every file the process can open. Paths outside it, including <code>../</code> traversal, fail with <code>PathOutsideAllowedRoot</code>. Give an agent a directory, not a filesystem.</p></div>
       <div class="card"><h3>MCP-native</h3><p>Ships as an MCP server, wired up by <code>csvql install</code>. Agents query CSV files directly; results are capped at about 100 rows / 12&nbsp;KB so a careless query can't flood the context or pull a table out one call at a time.</p></div>
       <div class="card"><h3>Read-only</h3><p>SELECT only. No INSERT/UPDATE/DELETE/DROP exists. It cannot modify your data.</p></div>

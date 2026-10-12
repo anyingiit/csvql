@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const version = "2.9.0";
 
 const help_text =
-    \\csvql — the world's fastest CSV query engine
+    \\csvql — SQL on CSV files in place, read-only
     \\
     \\USAGE:
     \\  csvql <file> [columns] [where] [limit] [orderby]
@@ -54,7 +54,7 @@ const help_text =
     \\           IS NULL / IS NOT NULL
     \\  GROUP BY column grouping with aggregate functions
     \\  HAVING   post-aggregation filter
-    \\  ORDER BY column ASC|DESC (positional ORDER BY 1 supported)
+    \\  ORDER BY one or more columns, each ASC|DESC (positional ORDER BY 1 supported)
     \\  LIMIT    number of rows
     \\  AS       column aliases: SELECT name AS n
     \\  DISTINCT deduplicate output rows
@@ -64,7 +64,8 @@ const help_text =
     \\NOT SUPPORTED:
     \\  correlated subqueries, subqueries in FROM/SELECT-list/HAVING-comparison
     \\  (col IN (SELECT ...) is the one supported subquery shape, single column,
-    \\  non-correlated — see CORRECTNESS.md), multiple ORDER BY columns,
+    \\  non-correlated — see CORRECTNESS.md), scalar functions in WHERE other
+    \\  than DATEDIFF/DATEADD/EXTRACT, LEFT/RIGHT/FULL/CROSS JOIN, window functions,
     \\  UNION, INTERSECT, EXCEPT, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:

@@ -43,7 +43,7 @@ Full posture, including the two known gaps on macOS and Windows: [SECURITY.md](S
 Say this up front so nobody picks csvql for a workload it will lose:
 
 - **It is not a database.** No `UNION`, no window functions, no `LEFT`/`RIGHT`/`FULL`/`CROSS JOIN` (inner hash join only), and the only subquery shape is `col IN (SELECT ...)`. Each of these errors clearly rather than returning wrong data. If you need full SQL, use DuckDB.
-- **Only `DATEDIFF`, `DATEADD` and `EXTRACT` work in `WHERE`.** Other scalar functions (`UPPER`, `LENGTH`, `ROUND`, ...) are `SELECT`-only for now.
+- **Only `DATEDIFF`, `DATEADD` and `EXTRACT` work in `WHERE`.** Other scalar functions (`UPPER`, `LENGTH`, `ROUND`, ...) are `SELECT`-only for now, and using one in `WHERE` currently fails with a misleading `ColumnNotFound` rather than a clear error.
 - **Quoted CSV is roughly 3x slower than unquoted.** The 16-byte skip that makes unquoted scans fast is disabled by quotes. Still faster than DuckDB on every shape measured, but by 1.6 to 2x rather than 6x.
 - **`MEDIAN` buffers every value in a group**, so on 20M rows it is 5x slower than DuckDB ([#205](https://github.com/melihbirim/csvql/issues/205)).
 - **CSV only.** JSON and JSONL are output formats, not input formats.
