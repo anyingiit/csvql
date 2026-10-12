@@ -127,9 +127,9 @@ Pasting a 417 MB CSV into a model would cost about 230 million tokens. It fits n
 | *"How many trips per cab type?"* | 43 |
 | *"Which year was busiest?"* | 49 |
 | *"Average fare by passenger count?"* | 123 |
-| Five questions, plus the tool schema paid once per conversation | ~560 |
+| Five questions over MCP, plus the tool schema paid once per conversation | ~640 |
 
-That cost is flat with file size: the same five questions cost the same on a 1 MB file and a 400 MB replica of it, to the token. Two caveats, both measured. The figures above count the CLI's CSV output; the MCP server returns JSON, which on these questions costs about 25% more because keys repeat per row. And the fairer comparison is not pasting but an agent that already has a shell and runs `duckdb -csv -c "..."`: that uses slightly *fewer* tokens than csvql over MCP. DuckDB's default box-drawing output costs about 1.7x more, and a model has to remember to turn it off. What csvql changes for that agent is not token count but `--root`, read-only execution, the output cap, and 54 MB of RAM instead of a few hundred. Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
+That cost is flat with file size: the same five questions cost the same on a 1 MB file and a 400 MB replica of it, to the token. Two caveats, both measured. The per-question figures count the CLI's CSV output; the MCP server returns JSON, which on these questions costs about 25% more because keys repeat per row, and the five-question total above is that JSON cost. And the fairer comparison is not pasting but an agent that already has a shell and runs `duckdb -csv -c "..."`: that uses slightly *fewer* tokens than csvql over MCP. DuckDB's default box-drawing output costs about 1.7x more, and a model has to remember to turn it off. What csvql changes for that agent is not token count but `--root`, read-only execution, the output cap, and 54 MB of RAM instead of a few hundred. Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
 
 ## Installation
 

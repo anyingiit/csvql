@@ -16,7 +16,7 @@ description: "Run SQL on CSV files in place, using about 10x less memory than a 
       <tr><td>"Average fare by passenger count?"</td><td><strong>123</strong></td></tr>
     </table>
     </div>
-    <p>Five questions cost about <strong>560 tokens</strong> in total, tool schema included, and that is flat regardless of file size. Against pasting the file this is a feasibility argument, not a savings figure: pasting was never an option. An agent that already shells out to <code>duckdb -csv</code> uses slightly fewer tokens than csvql over MCP, because MCP returns JSON; what csvql changes for that agent is <code>--root</code>, read-only execution, the output cap and the memory. One command wires it into Claude.</p>
+    <p>Five questions cost about <strong>640 tokens</strong> in total over MCP, tool schema included, and that is flat regardless of file size. Against pasting the file this is a feasibility argument, not a savings figure: pasting was never an option. An agent that already shells out to <code>duckdb -csv</code> uses slightly fewer tokens than csvql over MCP, because MCP returns JSON; what csvql changes for that agent is <code>--root</code>, read-only execution, the output cap and the memory. One command wires it into Claude.</p>
   </div>
 </section>
 

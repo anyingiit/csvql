@@ -3,7 +3,10 @@
 bench_tokens.py — token cost of pasting a CSV into an LLM vs querying it via csvql's MCP.
 
 Answers 5 realistic questions about the data both ways and counts the tokens the model
-would consume: the whole file (paste) vs the SQL + result rows (query). The query cost is
+would consume: the whole file (paste) vs the SQL + the MCP server's JSON response (query).
+The query column drives `csvql --mcp` over stdio and counts what the model actually
+receives; the MCP server returns JSON, which costs ~25% more than the CLI's CSV because
+keys repeat per row, so the CLI's CSV is shown alongside for reference. The query cost is
 flat — independent of file size — while the paste cost grows linearly and overflows the
 context window almost immediately.
 
@@ -14,9 +17,11 @@ Usage:
 Tokenizer: uses `tiktoken` (cl100k) if installed for exact counts; otherwise falls back to
 a char-based estimate and says so. `pip install tiktoken` for the accurate numbers.
 """
+import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -67,12 +72,48 @@ def paste_tokens(path):
         return tok(fh.read())
 
 
+def mcp_call(sql):
+    """Run one csv_query through `csvql --mcp` (stdio JSON-RPC) and return the text the
+    model receives. This is the real cost; the CLI's CSV stdout is cheaper and is not what
+    an agent sees."""
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "bench_tokens", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "csv_query", "arguments": {"sql": sql}}},
+    ]
+    proc = subprocess.run([CSVQL, "--mcp"], input="".join(json.dumps(m) + "\n" for m in msgs),
+                          capture_output=True, text=True, timeout=300)
+    for line in proc.stdout.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("id") == 2:
+            if "error" in obj:
+                sys.exit(f"csv_query failed: {obj['error']}")
+            return "".join(c.get("text", "") for c in obj["result"]["content"])
+    sys.exit(f"no MCP response for: {sql}\n{proc.stdout[:500]}{proc.stderr[:500]}")
+
+
 def query_tokens(path):
+    """Tokens for all QA over MCP: sent (question + SQL) + received (JSON response)."""
+    total = 0
+    for question, sql in QA:
+        q = sql.format(f=path)
+        total += tok(question) + tok(q) + tok(mcp_call(q))
+    return total
+
+
+def cli_csv_tokens(path):
+    """Same questions, counting the CLI's CSV stdout instead. Shown for reference only."""
     total = 0
     for question, sql in QA:
         q = sql.format(f=path)
         out = subprocess.run([CSVQL, q], capture_output=True, text=True).stdout
-        total += tok(question) + tok(q) + tok(out)  # sent (question+SQL) + received (rows)
+        total += tok(question) + tok(q) + tok(out)
     return total
 
 
@@ -115,22 +156,29 @@ def main():
 
     print(f"\n  Token cost: paste CSV into context  vs  query via csvql --mcp")
     print(f"  source={SRC}  rows={len(body):,}  tokenizer={TOKENIZER}\n")
-    print(f"  {'size':>7} {'rows':>10} {'paste':>13} {'query':>9} {'ratio':>9}  fits {CONTEXT_WINDOW//1000}K?")
+    print(f"  {'size':>7} {'rows':>10} {'paste':>13} {'query':>9} {'ratio':>9}  fits {CONTEXT_WINDOW//1000}K?  {'(cli csv)':>9}")
 
     schema_t = tok(TOOL_SCHEMA)
-    for label, n in sizes:
-        n = min(n, len(body))
-        slice_path = os.path.join(HERE, ".taxi-data", f"slice_{label.replace(' ', '')}.csv")
-        with open(slice_path, "w") as fh:
-            fh.write(header + "\n" + "\n".join(body[:n]) + "\n")
-        p = paste_tokens(slice_path)
-        q = query_tokens(slice_path) + schema_t  # amortized one-time schema counted once
-        os.remove(slice_path)
-        fits = "yes" if p <= CONTEXT_WINDOW else "NO"
-        print(f"  {label:>7} {n:>10,} {p:>13,} {q:>9,} {round(p / q):>8,}x  {fits}")
+    seen = set()
+    with tempfile.TemporaryDirectory(prefix="csvql-tokens-") as tmp:
+        for label, n in sizes:
+            n = min(n, len(body))
+            if n in seen:
+                continue  # the source is smaller than this size; the row would repeat
+            seen.add(n)
+            slice_path = os.path.join(tmp, f"slice_{label.replace(' ', '')}.csv")
+            with open(slice_path, "w") as fh:
+                fh.write(header + "\n" + "\n".join(body[:n]) + "\n")
+            p = paste_tokens(slice_path)
+            q = query_tokens(slice_path) + schema_t  # amortized one-time schema counted once
+            c = cli_csv_tokens(slice_path) + schema_t
+            fits = "yes" if p <= CONTEXT_WINDOW else "NO"
+            print(f"  {label:>7} {n:>10,} {p:>13,} {q:>9,} {round(p / q):>8,}x  {fits:<4} {c:>13,}")
 
-    print(f"\n  Query cost is flat — SQL + a few result rows, independent of file size.")
+    print(f"\n  Query cost is flat — SQL + a few result rows as JSON, independent of file size.")
     print(f"  MCP tool schema: {schema_t} tokens, paid once per conversation (not per query).")
+    print(f"  (cli csv) is the same work counted over the CLI's CSV stdout; MCP returns JSON,")
+    print(f"  which costs more because keys repeat per row. The query column is what an agent pays.")
 
     # The honest competitor: an agent with a shell, not an agent pasting a file.
     dd = duckdb_shell_tokens(SRC)
@@ -142,8 +190,10 @@ def main():
         print(f"    csvql via MCP                    {mcp:>6,} tokens")
         print(f"    duckdb via shell, -csv           {dd['csv']:>6,} tokens  ({dd['csv']/mcp:.2f}x)")
         print(f"    duckdb via shell, default output {dd['box']:>6,} tokens  ({dd['box']/mcp:.2f}x)")
-        print("    The -csv row is the one to beat; the gap is small and the flag is")
-        print("    easy for a model to forget, which is most of the difference.\n")
+        print("    The -csv row is the one to beat, and it can come out slightly cheaper than")
+        print("    csvql over MCP, because MCP returns JSON. The box row is what an agent gets")
+        print("    when it forgets the flag. The case for csvql with agents is --root, read-only")
+        print("    execution, the output cap and memory, not token count.\n")
 
 
 if __name__ == "__main__":
