@@ -6,11 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Release](https://img.shields.io/github/v/release/melihbirim/csvql)](https://github.com/melihbirim/csvql/releases)
 
-**Give an AI agent read-only SQL over your CSV files, where they already live.**
+**Read-only SQL on CSV files, in place, for AI agents.**
 
 > A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
-csvql runs `SELECT` on CSV files in place: no import, no ingest, no server to stand up. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few rows instead of the file. It is one static binary written in Zig, it makes no network calls, and it has no way to write to your data.
+csvql runs `SELECT` on CSV files where they sit: no import, no ingest, no server. It is about as fast as DuckDB and polars on raw CSV and uses 3 to 11x less memory. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few rows instead of the file. One static Zig binary, no network calls, no way to write to your data.
 
 ```bash
 $ csvql "SELECT cab_type, COUNT(*) FROM 'trips.csv' GROUP BY cab_type"
@@ -25,30 +25,26 @@ yellow,967553
 
 ## Why this exists
 
-Agents are getting access to corporate data. The common path is to hand them a database connection or to upload files to the model. Both move data. csvql is the third option: run it *next to the data*, on your own box, and let the agent query it there.
+Agents are getting access to company data. The usual paths are a database connection or uploading files to the model. Both move the data. csvql is the third option: run it next to the data, on your own box, and let the agent query it there. Everything below is checkable in the source.
 
-What that buys you, and what you can verify in the source:
+- **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
+- **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
+- **Sandboxed by a flag.** `--root /data` confines every file the process can open. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
+- **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context or pull a table out one call at a time.
+- **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
+- **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you inherit your existing keys, bastion and logs.
 
-- **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. The engine has no code path that writes to an input file.
-- **No network.** No `std.net`, `std.http` or socket call anywhere in the codebase. No telemetry, no update check. Runs air-gapped. `strace -f -e trace=network` will show you an empty trace.
-- **Sandboxed by a flag.** `--root /data` confines every file the process can open. `/etc/passwd` and `../` traversal are rejected with `PathOutsideAllowedRoot`.
-- **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call, so a careless `SELECT *` cannot flood the context or exfiltrate a table one call at a time.
-- **Flat memory.** An aggregate query holds a running accumulator, not a dataset: 74 MB on a 0.69 GB file and 74 MB on an 8.14 GB one, measured the same way. It fits on the small VM sitting beside the data.
-- **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you also inherit your existing keys, bastion and logs.
-
-Full posture, including the two known gaps on macOS and Windows: [SECURITY.md](SECURITY.md).
+Full posture, including two known gaps on macOS and Windows: [SECURITY.md](SECURITY.md).
 
 ## What it does not do
 
-Say this up front so nobody picks csvql for a workload it will lose:
-
-- **It is not a database.** No `UNION`, no window functions, no `LEFT`/`RIGHT`/`FULL`/`CROSS JOIN` (inner hash join only), and the only subquery shape is `col IN (SELECT ...)`. Each of these errors clearly rather than returning wrong data. If you need full SQL, use DuckDB.
-- **Only `DATEDIFF`, `DATEADD` and `EXTRACT` work in `WHERE`.** Other scalar functions (`UPPER`, `LENGTH`, `ROUND`, ...) are `SELECT`-only for now, and using one in `WHERE` currently fails with a misleading `ColumnNotFound` rather than a clear error.
-- **Quoted CSV is roughly 3x slower than unquoted.** The 16-byte skip that makes unquoted scans fast is disabled by quotes. Still faster than DuckDB on every shape measured, but by 1.6 to 2x rather than 6x.
-- **`MEDIAN` buffers every value in a group**, so on 20M rows it is 5x slower than DuckDB ([#205](https://github.com/melihbirim/csvql/issues/205)).
+- **It is not a database.** No `UNION`, no window functions, no `LEFT`/`RIGHT`/`FULL`/`CROSS JOIN` (inner hash join only). The only subquery shape is `col IN (SELECT ...)`. These error rather than return wrong data. If you need full SQL, use DuckDB.
+- **Scalar functions in `WHERE`** are limited to `DATEDIFF`, `DATEADD` and `EXTRACT`. Others (`UPPER`, `ROUND`, ...) are `SELECT`-only and currently fail in `WHERE` with a misleading `ColumnNotFound`.
+- **Quoted CSV is about 3x slower** than unquoted. Quotes disable the 16-byte skip the scanner relies on.
+- **`MEDIAN` buffers every value in a group**, so on 20M rows it is 5x slower than DuckDB ([#205](https://github.com/melihbirim/csvql/issues/205)). High-cardinality `GROUP BY` (millions of groups) is also slower.
 - **CSV only.** JSON and JSONL are output formats, not input formats.
 
-The complete list with tracking issues: [SQL_REFERENCE.md#known-limitations](SQL_REFERENCE.md#known-limitations).
+Full list with tracking issues: [SQL_REFERENCE.md#known-limitations](SQL_REFERENCE.md#known-limitations).
 
 ## Quick Start
 
@@ -71,7 +67,7 @@ csvql "SELECT name, age FROM 'data.csv' LIMIT 3" --json      # or --jsonl, --mar
 csvql --schema data.csv
 ```
 
-Flags you will reach for: `-d/--delimiter`, `--json`, `--jsonl`, `--markdown`, `--no-header`, `--no-input-header` (headerless files get `c1..cN`), `-o/--output`, `--threads`, `--strict`, `--schema`, `--root`, `--audit`, `--mcp`. The full list with semantics is in `csvql --help`. Simple mode is documented in [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md).
+Flags: `-d/--delimiter`, `--json`, `--jsonl`, `--markdown`, `--no-header`, `--no-input-header` (headerless files get `c1..cN`), `-o/--output`, `--threads`, `--strict`, `--schema`, `--root`, `--audit`, `--mcp`. Details in `csvql --help`. Simple mode: [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md).
 
 ## For agents (MCP)
 
@@ -93,9 +89,9 @@ VS Code (Copilot) takes the same `command`/`args` under `servers` in `.vscode/mc
 
 ### Tools
 
-| Tool | What it returns |
-|------|-----------------|
-| `csv_query(sql)` | Query results as JSON, capped at about 100 rows / 12 KB |
+| Tool | Returns |
+|------|---------|
+| `csv_query(sql)` | Results as JSON, capped at about 100 rows / 12 KB |
 | `csv_schema(file)` | Column names and a few sample rows |
 | `csv_list(directory?)` | CSV files in a directory |
 
@@ -116,20 +112,11 @@ Run csvql on the server next to the data and connect over SSH. Only the SQL and 
 { "command": "ssh", "args": ["analyst@dataserver", "csvql", "--mcp", "--root", "/data"] }
 ```
 
-Always set `--root` when an agent or another user can reach csvql. Pair it with an unprivileged OS user and a read-only mount for defense in depth. Hardening checklist: [SECURITY.md#hardening-for-on-prem-and-remote-access](SECURITY.md#hardening-for-on-prem-and-remote-access).
+Always set `--root` when an agent or another user can reach csvql. Pair it with an unprivileged OS user and a read-only mount. Checklist: [SECURITY.md#hardening-for-on-prem-and-remote-access](SECURITY.md#hardening-for-on-prem-and-remote-access).
 
 ### Token cost
 
-Pasting a 417 MB CSV into a model would cost about 230 million tokens. It fits no context window, so the comparison is about feasibility, not savings. Over MCP the agent sends SQL and gets rows back:
-
-| Question an agent asks | Tokens |
-| ---------------------- | ------ |
-| *"How many trips per cab type?"* | 43 |
-| *"Which year was busiest?"* | 49 |
-| *"Average fare by passenger count?"* | 123 |
-| Five questions over MCP, plus the tool schema paid once per conversation | ~640 |
-
-That cost is flat with file size: the same five questions cost the same on a 1 MB file and a 400 MB replica of it, to the token. Two caveats, both measured. The per-question figures count the CLI's CSV output; the MCP server returns JSON, which on these questions costs about 25% more because keys repeat per row, and the five-question total above is that JSON cost. And the fairer comparison is not pasting but an agent that already has a shell and runs `duckdb -csv -c "..."`: that uses slightly *fewer* tokens than csvql over MCP. DuckDB's default box-drawing output costs about 1.7x more, and a model has to remember to turn it off. What csvql changes for that agent is not token count but `--root`, read-only execution, the output cap, and 54 MB of RAM instead of a few hundred. Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
+Five questions about a taxi dataset cost about 640 tokens over MCP, tool schema included, and the cost does not change with file size. Pasting the 417 MB file would cost about 230 million tokens, which is a feasibility argument, not a savings figure. An agent that already has a shell and runs `duckdb -csv` uses slightly fewer tokens than csvql over MCP, because MCP returns JSON. The case for csvql with agents is `--root`, read-only execution, the output cap and memory, not token count. Measure it: [`bench/bench_tokens.py`](bench/bench_tokens.py).
 
 ## Installation
 
@@ -174,37 +161,22 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 ## Performance
 
-Speed is the reason the memory stays flat and the box stays small, so it is worth stating. It is not the reason to pick csvql over DuckDB: on an agent's timescale both are instant. Numbers below are Apple M2 Pro unless stated; every one has a reproduce script next to it.
+Same `GROUP BY department` on raw CSV, one process per engine, Apple M2 Pro with 16 GB. Peak memory and wall time:
 
-**Memory is the headline.** Same `GROUP BY department`, four engines, one process each, 16 GB machine. Peak RSS and wall time:
-
-| file | csvql | DuckDB | polars 2.0 | pandas |
-| --- | --- | --- | --- | --- |
-| 0.69 GB | **74 MB / 0.2s** | 254 MB / 0.8s | 1151 MB / 0.6s | 1445 MB / 6.5s |
-| 1.89 GB | **74 MB / 0.4s** | 253 MB / 1.2s | 2107 MB / 1.1s | 2093 MB / 17.5s |
-| 3.80 GB | **75 MB / 0.7s** | 275 MB / 2.1s | 2666 MB / 9.8s | 2355 MB / 36.4s |
-| 8.14 GB | **74 MB / 2.4s** | 367 MB / 5.5s | 1754 MB / 26.7s | 4024 MB / 90.8s |
-
-csvql's memory does not move with file size because an aggregate holds an accumulator, not a dataset. Three honest caveats: DuckDB is also nearly flat, so against it the memory gap is about 3.7x, not the 15x polars suggests; every engine here finished the 8 GB file on 16 GB of RAM, so there is no cliff the others fall off; and flat memory is a property of aggregates, not of every query. `ORDER BY` has to hold rows, and a top-N on the 711 MB file peaks at 715 MB. All four columns are measured in-process from Python, so each carries the interpreter's ~20 MB; the CLI measured directly reads 54 MB.
-
-**Speed on raw CSV, 20M rows / 711 MB**, median of 5, one query per process, engines interleaved:
-
-| Query | csvql | polars 2.0 | DuckDB |
+| File | csvql | DuckDB | polars 2.0 |
 | --- | --- | --- | --- |
-| `SUM(salary)` | **0.081s** | 0.227s | 0.372s |
-| `COUNT(*) GROUP BY department` | **0.124s** | 0.317s | 0.498s |
-| `COUNT(*) WHERE city = '...'` | **0.080s** | 0.282s | 0.435s |
-| `COUNT(*)` | 0.026s | **0.022s** | 0.401s |
-| `ORDER BY salary LIMIT 10` | 0.344s | **0.305s** | 0.420s |
-| `MEDIAN(salary) GROUP BY department` | 2.832s | | **0.580s** |
+| 0.69 GB | **74 MB** / 0.2s | 254 MB / 0.8s | 1151 MB / 0.6s |
+| 1.89 GB | **74 MB** / 0.4s | 253 MB / 1.2s | 2107 MB / 1.1s |
+| 3.80 GB | **75 MB** / 0.7s | 275 MB / 2.1s | 2666 MB / 9.8s |
+| 8.14 GB | **74 MB** / 2.4s | 367 MB / 5.5s | 1754 MB / 26.7s |
 
-Wins by 2.6 to 5.4x on the scans and aggregates agents actually run. Draws with polars on `COUNT(*)`, which is bandwidth-bound for everyone at this size, and on top-N. Loses on `MEDIAN` ([#205](https://github.com/melihbirim/csvql/issues/205)). On the 8 GB NYC taxi file the gap over DuckDB settles at about 3.2x with roughly 6x less memory and no 2.1 GB native store to build first.
+Memory is flat because an aggregate holds an accumulator, not a dataset. That holds for aggregates, not for `ORDER BY`, which has to keep rows. Speed is in the same band as the other two: csvql is 2 to 5x ahead on scans, filters and small files, far ahead on joins against raw CSV, level with polars on `COUNT(*)` and top-N, and behind DuckDB on `MEDIAN` and on `GROUP BY` with millions of groups. None of that matters on an agent's timescale. The memory does, because it decides what box csvql can run on.
 
-Everything else, including quoted versus unquoted CSV, column-count scaling, wide files, joins, `LIKE`, subqueries, DataFusion, and the methodology: **[BENCHMARKS.md](BENCHMARKS.md)**. Reproduce any number: [`bench/bench_all.sh`](bench/bench_all.sh), [`bench/bench_vs_polars.sh`](bench/bench_vs_polars.sh), [`bench/bench_taxi.sh`](bench/bench_taxi.sh).
+Every number has a reproduce script. Full tables, including quoted CSV, wide files, joins, subqueries and the losses: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## SQL
 
-`SELECT` / `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, inner `JOIN` (chained), `col IN (SELECT ...)`, `LIKE` / `ILIKE` / `BETWEEN` / `IS NULL` / `AND` / `OR` / `NOT`, `DISTINCT`, `CASE WHEN`. Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT`, `COUNT(DISTINCT)`. Scalars in `SELECT`: string (`UPPER`, `LOWER`, `TRIM`, `LENGTH`, `REVERSE`, `CONCAT`, `SUBSTR`, `REPLACE`, `SPLIT_PART`, `LPAD`, `RPAD`), math (`ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD`, `ROUND`, `TRUNC`, `SQRT`, `POWER`, `LN`, `LOG`, `EXP`, `GREATEST`, `LEAST`), `CAST`, `COALESCE`, and dates (`STRFTIME`, `DATE_PART`, `EXTRACT`, `DATEDIFF`, `DATEADD`).
+`SELECT` / `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, inner `JOIN` (chained), `col IN (SELECT ...)`, `LIKE` / `ILIKE` / `BETWEEN` / `IS NULL` / `AND` / `OR` / `NOT`, `DISTINCT`, `CASE WHEN`. Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT`, `COUNT(DISTINCT)`. Scalars in `SELECT`: string (`UPPER`, `LOWER`, `TRIM`, `LENGTH`, `REVERSE`, `CONCAT`, `SUBSTR`, `REPLACE`, `SPLIT_PART`, `LPAD`, `RPAD`), math (`ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD`, `ROUND`, `TRUNC`, `SQRT`, `POWER`, `LN`, `LOG`, `EXP`, `GREATEST`, `LEAST`), `CAST`, `COALESCE`, dates (`STRFTIME`, `DATE_PART`, `EXTRACT`, `DATEDIFF`, `DATEADD`).
 
 ```bash
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' WHERE salary > 50000 GROUP BY department HAVING COUNT(*) > 10 ORDER BY department"
@@ -212,7 +184,7 @@ csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' 
 csvql "SELECT id FROM 'orders.csv' WHERE customer_id IN (SELECT id FROM 'customers.csv' WHERE region = 'EU')"
 ```
 
-Full syntax, runnable examples, DuckDB differences and limitations: **[SQL_REFERENCE.md](SQL_REFERENCE.md)**. What is differentially tested against DuckDB and how: **[CORRECTNESS.md](CORRECTNESS.md)**.
+Full syntax and limitations: **[SQL_REFERENCE.md](SQL_REFERENCE.md)**. What is differentially tested against DuckDB: **[CORRECTNESS.md](CORRECTNESS.md)**.
 
 ## Documentation
 
@@ -233,7 +205,7 @@ Full syntax, runnable examples, DuckDB differences and limitations: **[SQL_REFER
 - `MEDIAN` in O(groups) memory ([#205](https://github.com/melihbirim/csvql/issues/205)).
 - Shell completions, help wanted ([#73](https://github.com/melihbirim/csvql/issues/73)).
 
-Shipped features are in the [release notes](https://github.com/melihbirim/csvql/releases). The [good first issues](https://github.com/melihbirim/csvql/labels/good%20first%20issue) are scoped with file pointers and done-when criteria.
+Shipped features are in the [release notes](https://github.com/melihbirim/csvql/releases). [Good first issues](https://github.com/melihbirim/csvql/labels/good%20first%20issue) are scoped with file pointers and done-when criteria.
 
 ## License
 
