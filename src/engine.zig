@@ -2930,6 +2930,8 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .upper => |*ci| ci.* = 0,
         .lower => |*ci| ci.* = 0,
         .trim => |*ci| ci.* = 0,
+        .ltrim => |*ci| ci.* = 0,
+        .rtrim => |*ci| ci.* = 0,
         .reverse => |*ci| ci.* = 0,
         .length => |*ci| ci.* = 0,
         .abs => |*ci| ci.* = 0,
@@ -2940,6 +2942,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .cast_float => |*ci| ci.* = 0,
         .cast_text => |*ci| ci.* = 0,
         .substr => |*a| a.col_idx = 0,
+        .left, .right => |*a| a.col_idx = 0,
         .lpad, .rpad => |*a| a.col_idx = 0,
         .mod_op => |*a| a.col_idx = 0,
         .math => |*a| a.col_idx = 0,
@@ -8682,6 +8685,45 @@ test "LPAD/RPAD: pads through the full query pipeline" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "000ab,ab000"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "00xyz,xyz00"));
+}
+
+test "LTRIM/RTRIM/LEFT/RIGHT: evaluate through the full query pipeline" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\n\"  padded  \"\nreport.csv\n\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT LTRIM(v) AS l, RTRIM(v) AS r, LEFT(v, 6) AS lf, RIGHT(v, 4) AS rt, " ++
+            "RIGHT(v, -2) AS rn, UPPER(LTRIM(v)) AS u FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    const expected =
+        "l,r,lf,rt,rn,u\n" ++
+        "padded  ,  padded,  padd,ed  ,padded  ,PADDED  \n" ++
+        "report.csv,report.csv,report,.csv,port.csv,REPORT.CSV\n" ++
+        ",,,,,\n";
+    try std.testing.expectEqualStrings(expected, data);
 }
 
 test "SQRT/POWER/LN/LOG/EXP/TRUNC: evaluate through the full query pipeline" {

@@ -3,7 +3,8 @@
 /// Supports: UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR/SUBSTRING,
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD, SQRT, POWER/POW, LN, LOG,
-///           EXP, TRUNC, NULLIF, IFNULL
+///           EXP, TRUNC, NULLIF, IFNULL,
+///           LTRIM, RTRIM, LEFT, RIGHT
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -27,6 +28,10 @@ pub const ScalarSpec = union(enum) {
     reverse: usize, // REVERSE(col)
     length: usize, // LENGTH(col) — returns character count as string
     substr: SubstrArgs, // SUBSTR(col, start[, len]) — 1-based SQL semantics
+    ltrim: usize, // LTRIM(col) — trim whitespace on the left only
+    rtrim: usize, // RTRIM(col) — trim whitespace on the right only
+    left: CountArgs, // LEFT(col, n) — first n bytes; negative n drops the last |n|
+    right: CountArgs, // RIGHT(col, n) — last n bytes; negative n drops the first |n|
     lpad: PadArgs, // LPAD(col, len[, pad]) — pad on the left, default pad is a space
     rpad: PadArgs, // RPAD(col, len[, pad]) — pad on the right, default pad is a space
     abs: usize, // ABS(col)
@@ -70,6 +75,11 @@ pub const ScalarSpec = union(enum) {
         col_idx: usize,
         start: i32, // 1-based; negative = count from end
         len: i32, // -1 = to end of string
+    };
+
+    pub const CountArgs = struct {
+        col_idx: usize,
+        n: i64,
     };
 
     pub const PadArgs = struct {
@@ -219,8 +229,9 @@ pub const ScalarSpec = union(enum) {
     /// Return the primary column index this spec operates on.
     pub fn colIdx(self: ScalarSpec) usize {
         return switch (self) {
-            .upper, .lower, .trim, .reverse, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
+            .upper, .lower, .trim, .ltrim, .rtrim, .reverse, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
+            .left, .right => |a| a.col_idx,
             .lpad, .rpad => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .math => |a| a.col_idx,
@@ -325,6 +336,8 @@ pub fn tryParseScalar(
     const single_arg_fn = std.mem.eql(u8, fn_lower, "upper") or
         std.mem.eql(u8, fn_lower, "lower") or
         std.mem.eql(u8, fn_lower, "trim") or
+        std.mem.eql(u8, fn_lower, "ltrim") or
+        std.mem.eql(u8, fn_lower, "rtrim") or
         std.mem.eql(u8, fn_lower, "reverse") or
         std.mem.eql(u8, fn_lower, "length") or
         std.mem.eql(u8, fn_lower, "abs") or
@@ -364,6 +377,8 @@ pub fn tryParseScalar(
         if (std.mem.eql(u8, fn_lower, "upper")) return .{ .upper = cidx };
         if (std.mem.eql(u8, fn_lower, "lower")) return .{ .lower = cidx };
         if (std.mem.eql(u8, fn_lower, "trim")) return .{ .trim = cidx };
+        if (std.mem.eql(u8, fn_lower, "ltrim")) return .{ .ltrim = cidx };
+        if (std.mem.eql(u8, fn_lower, "rtrim")) return .{ .rtrim = cidx };
         if (std.mem.eql(u8, fn_lower, "reverse")) return .{ .reverse = cidx };
         if (std.mem.eql(u8, fn_lower, "length")) return .{ .length = cidx };
         if (std.mem.eql(u8, fn_lower, "abs")) return .{ .abs = cidx };
@@ -393,6 +408,19 @@ pub fn tryParseScalar(
             -1;
 
         return .{ .substr = .{ .col_idx = cidx, .start = start, .len = len } };
+    }
+
+    // ── LEFT / RIGHT(col, n) ───────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "left") or std.mem.eql(u8, fn_lower, "right")) {
+        // Exactly two arguments, the second an integer literal.
+        const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse return error.InvalidQuery;
+        const col_str = std.mem.trim(u8, args_str[0..comma], &std.ascii.whitespace);
+        const n_str = std.mem.trim(u8, args_str[comma + 1 ..], &std.ascii.whitespace);
+        const n = std.fmt.parseInt(i64, n_str, 10) catch return error.InvalidQuery;
+        const cidx = try resolveCol(col_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+        if (std.mem.eql(u8, fn_lower, "left")) return .{ .left = .{ .col_idx = cidx, .n = n } };
+        return .{ .right = .{ .col_idx = cidx, .n = n } };
     }
 
     // ── LPAD / RPAD(col, len[, pad]) ────────────────────────────────────────
@@ -895,6 +923,10 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         .trim => |cidx| {
             return std.mem.trim(u8, field(record, cidx), &std.ascii.whitespace);
         },
+        .ltrim => |cidx| return std.mem.trimLeft(u8, field(record, cidx), &std.ascii.whitespace),
+        .rtrim => |cidx| return std.mem.trimRight(u8, field(record, cidx), &std.ascii.whitespace),
+        .left => |args| return leftBytes(field(record, args.col_idx), args.n),
+        .right => |args| return rightBytes(field(record, args.col_idx), args.n),
         .reverse => |cidx| {
             const v = field(record, cidx);
             if (v.len == 0) return v;
@@ -1302,6 +1334,30 @@ fn padTo(v: []const u8, target_len: usize, pad: []const u8, comptime left: bool,
     return buf;
 }
 
+/// The first `n` bytes of `v`; a negative `n` drops the last `-n` bytes. Counts
+/// are bytes, like LENGTH and SUBSTR, but the cut never lands inside a
+/// multi-byte character, so the result is always valid UTF-8 (it can be
+/// shorter than `n`).
+fn leftBytes(v: []const u8, n: i64) []const u8 {
+    if (v.len == 0) return v;
+    const len: i64 = @intCast(v.len);
+    const m = std.math.clamp(n, -len, len);
+    var end: usize = @intCast(if (m >= 0) m else len + m);
+    while (end > 0 and end < v.len and v[end] & 0xc0 == 0x80) end -= 1;
+    return v[0..end];
+}
+
+/// The last `n` bytes of `v`; a negative `n` drops the first `-n` bytes. Same
+/// byte counting and character-boundary rule as `leftBytes`.
+fn rightBytes(v: []const u8, n: i64) []const u8 {
+    if (v.len == 0) return v;
+    const len: i64 = @intCast(v.len);
+    const m = std.math.clamp(n, -len, len);
+    var start: usize = @intCast(if (m >= 0) len - m else -m);
+    while (start < v.len and v[start] & 0xc0 == 0x80) start += 1;
+    return v[start..];
+}
+
 inline fn field(record: []const []const u8, idx: usize) []const u8 {
     return if (idx < record.len) record[idx] else "";
 }
@@ -1701,6 +1757,118 @@ test "SPLIT_PART: n-th field, 1-based, out of range empty" {
     fba.reset();
     try std.testing.expectEqualStrings("", eval(sp5, &.{"alice@example.com"}, fba.allocator()));
     try std.testing.expect((try tryParseScalar("SPLIT_PART(s, '@', 0)", cm, allocator)) == null);
+}
+
+test "LTRIM/RTRIM: trim one side only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lt = (try tryParseScalar("LTRIM(s)", cm, allocator)).?;
+    const rt = (try tryParseScalar("rtrim(s)", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    try std.testing.expectEqualStrings("ab \t", eval(lt, &.{" \t ab \t"}, a));
+    try std.testing.expectEqualStrings(" \t ab", eval(rt, &.{" \t ab \t"}, a));
+    try std.testing.expectEqualStrings("a b", eval(lt, &.{"a b"}, a));
+    try std.testing.expectEqualStrings("", eval(lt, &.{"   "}, a));
+    try std.testing.expectEqualStrings("", eval(rt, &.{"   "}, a));
+    try std.testing.expectEqualStrings("", eval(lt, &.{""}, a));
+}
+
+test "LTRIM/RTRIM: can be the inner call of a nested function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const spec = (try tryParseScalar("UPPER(LTRIM(s))", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("AB ", eval(spec, &.{"  ab "}, fba.allocator()));
+}
+
+test "LEFT/RIGHT: counts, boundaries and negative counts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    const cases = [_]struct { expr: []const u8, input: []const u8, want: []const u8 }{
+        .{ .expr = "LEFT(s, 3)", .input = "abcdef", .want = "abc" },
+        .{ .expr = "RIGHT(s, 3)", .input = "abcdef", .want = "def" },
+        .{ .expr = "LEFT(s, 6)", .input = "abcdef", .want = "abcdef" },
+        .{ .expr = "RIGHT(s, 6)", .input = "abcdef", .want = "abcdef" },
+        .{ .expr = "LEFT(s, 99)", .input = "abcdef", .want = "abcdef" },
+        .{ .expr = "RIGHT(s, 99)", .input = "abcdef", .want = "abcdef" },
+        .{ .expr = "LEFT(s, 0)", .input = "abcdef", .want = "" },
+        .{ .expr = "RIGHT(s, 0)", .input = "abcdef", .want = "" },
+        .{ .expr = "LEFT(s, -2)", .input = "abcdef", .want = "abcd" },
+        .{ .expr = "RIGHT(s, -2)", .input = "abcdef", .want = "cdef" },
+        .{ .expr = "LEFT(s, -6)", .input = "abcdef", .want = "" },
+        .{ .expr = "RIGHT(s, -99)", .input = "abcdef", .want = "" },
+        .{ .expr = "LEFT(s, 9223372036854775807)", .input = "abc", .want = "abc" },
+        .{ .expr = "RIGHT(s, 9223372036854775807)", .input = "abc", .want = "abc" },
+        .{ .expr = "LEFT(s, -9223372036854775808)", .input = "abc", .want = "" },
+        .{ .expr = "RIGHT(s, -9223372036854775808)", .input = "abc", .want = "" },
+        .{ .expr = "left( s ,2 )", .input = "abc", .want = "ab" },
+        .{ .expr = "LEFT(s, 2)", .input = "", .want = "" },
+        .{ .expr = "RIGHT(s, 2)", .input = "", .want = "" },
+    };
+    for (cases) |c| {
+        const spec = (try tryParseScalar(c.expr, cm, allocator)).?;
+        try std.testing.expectEqualStrings(c.want, eval(spec, &.{c.input}, a));
+    }
+}
+
+test "LEFT/RIGHT: count bytes but never split a multi-byte character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    // "é" is two bytes (c3 a9), "€" is three.
+    const word = "h\xc3\xa9llo";
+    const left3 = (try tryParseScalar("LEFT(s, 3)", cm, allocator)).?;
+    const left2 = (try tryParseScalar("LEFT(s, 2)", cm, allocator)).?;
+    const right4 = (try tryParseScalar("RIGHT(s, 4)", cm, allocator)).?;
+    const right5 = (try tryParseScalar("RIGHT(s, 5)", cm, allocator)).?;
+    try std.testing.expectEqualStrings("h\xc3\xa9", eval(left3, &.{word}, a));
+    try std.testing.expectEqualStrings("h", eval(left2, &.{word}, a));
+    try std.testing.expectEqualStrings("llo", eval(right4, &.{word}, a));
+    try std.testing.expectEqualStrings("\xc3\xa9llo", eval(right5, &.{word}, a));
+
+    const euro = (try tryParseScalar("LEFT(s, 4)", cm, allocator)).?;
+    try std.testing.expectEqualStrings("\xe2\x82\xac", eval(euro, &.{"\xe2\x82\xac\xe2\x82\xac"}, a));
+}
+
+test "LEFT/RIGHT: malformed calls are query errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("LEFT(s)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("RIGHT(s, 1, 2)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("LEFT(s, 1.5)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("RIGHT(s, x)", cm, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("LEFT(nope, 1)", cm, allocator));
 }
 
 test "LPAD/RPAD: basic pad-left and pad-right" {
