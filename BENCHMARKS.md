@@ -190,6 +190,66 @@ Note on the Polars API: `pl.read_csv` (eager) got slower in 2.0 while `pl.scan_c
 
 Reproduce: `./bench/bench_vs_polars.sh fixture.csv 6`.
 
+## Small files, startup included
+
+**2M rows, 69 MB, unquoted CSV, Apple M2 Pro**, both engines reading the raw file. Mean of 30 runs, because a single run finishes faster than a shell timer can resolve.
+
+| Query | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- |
+| `COUNT(*)` | **0.0139s** | 0.1185s | **8.5x** |
+| `COUNT(*) WHERE age > 30` | **0.0134s** | 0.1170s | **8.7x** |
+| `SUM(salary), AVG(salary)` | **0.0180s** | 0.1178s | **6.5x** |
+
+At this size process startup is a visible share of both totals: 0.022s for DuckDB, 0.005s for csvql. Subtracting it, `COUNT(*)` is 10.5x rather than 8.5x, so these figures understate rather than flatter.
+
+**20M rows, 711 MB** (best-of-5):
+
+| Query                                   | csvql      | DuckDB | Speedup   |
+| --------------------------------------- | ---------- | ------ | --------- |
+| `COUNT(*) GROUP BY department`          | **0.098s** | 0.484s | **4.9x**  |
+| `COUNT(*) WHERE age > 30 GROUP BY`      | **0.102s** | 0.506s | **5.0x**  |
+| `SELECT DISTINCT city`                  | **0.090s** | 0.494s | **5.5x**  |
+| `SUM(salary), AVG(salary) GROUP BY`     | **0.132s** | 0.540s | **4.1x**  |
+| `MEDIAN(salary) GROUP BY department`    | 2.832s     | **0.580s** | **0.2x** |
+
+The last row is a real loss, not a rounding artefact: `MEDIAN` buffers every value in a group, so its memory and time are O(rows) rather than O(groups) ([#205](https://github.com/melihbirim/csvql/issues/205)).
+
+## Quoting and column count
+
+Quoting changes the picture; column count does not. csvql skips 16 bytes at a time whenever no delimiter, newline or quote is present, and a quoted field disables that. Same files, ~200-byte rows, differing only in whether one column is quoted, `COUNT(*)` with a `WHERE`, 12 threads:
+
+| Columns | Quoting | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- | --- |
+| 2 | unquoted | **0.026s** | 0.170s | **6.5x** |
+| 2 | quoted | 0.084s | 0.136s | 1.6x |
+| 8 | unquoted | **0.040s** | 0.240s | **6.0x** |
+| 8 | quoted | 0.116s | 0.236s | 2.0x |
+| 32 | unquoted | **0.080s** | 0.458s | **5.7x** |
+| 32 | quoted | 0.196s | 0.384s | 2.0x |
+
+The speedup is steady across a sixteen-fold range of column counts. Quoting is the variable that matters, costing roughly 3x. Reproduce with [`bench/bench_scaling.sh`](bench/bench_scaling.sh). Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
+
+## Memory and time across file sizes
+
+Same `GROUP BY department`, four engines, one process each, across a 12x range of file size on a 16 GB machine. Peak RSS and wall time:
+
+| file | csvql | DuckDB | polars 2.0 | pandas |
+| --- | --- | --- | --- | --- |
+| 0.69 GB | **74 MB / 0.2s** | 254 MB / 0.8s | 1151 MB / 0.6s | 1445 MB / 6.5s |
+| 1.89 GB | **74 MB / 0.4s** | 253 MB / 1.2s | 2107 MB / 1.1s | 2093 MB / 17.5s |
+| 3.80 GB | **75 MB / 0.7s** | 275 MB / 2.1s | 2666 MB / 9.8s | 2355 MB / 36.4s |
+| 8.14 GB | **74 MB / 2.4s** | 367 MB / 5.5s | 1754 MB / 26.7s | 4024 MB / 90.8s |
+
+csvql's memory does not move with file size because an aggregate holds a running accumulator rather than a dataset. The time advantage over polars grows with the file, from 3x to 11x, and over pandas from 33x to 38x.
+
+Two things worth saying plainly. **DuckDB is the memory-efficient competitor, not polars**: 254 to 367 MB across the same range, nearly as flat as csvql, so against DuckDB the memory difference is 3.7x rather than the 15x polars suggests. And every engine here finished the 8 GB file on 16 GB of RAM, so there is no point at which the others fall over and csvql keeps going. pandas peaks at 4 GB on an 8 GB file because it stores parsed typed columns rather than text, and polars' peak is not even monotonic (2666 MB at 3.8 GB, 1754 MB at 8.1 GB), so do not extrapolate either curve.
+
+Flat memory is a property of aggregate queries, not of every query: `ORDER BY` has to hold rows, and the 711 MB file peaks at 715 MB on a top-N.
+
+All four columns are measured the same way, in-process from Python via `ru_maxrss`, so each includes the interpreter's own footprint of roughly 20 MB. That is why csvql reads 74 MB here and 54 MB when the CLI is measured directly. pandas, measured separately on the same `GROUP BY`, takes 0.54s at 2M rows and 6.72s at 20M; that margin says more about `read_csv` loading the whole file into a DataFrame than about either engine.
+
+Reproduce with [`bench/bench_vs_polars.sh`](bench/bench_vs_polars.sh). Full working and the corrections to an earlier version of these numbers: [csvql vs polars](https://melihbirim.github.io/csvql/blog/csvql-vs-polars.html).
+
 ## How is csvql so fast?
 
 - **Memory-mapped I/O** — zero-copy reading at 1.4 GB/sec

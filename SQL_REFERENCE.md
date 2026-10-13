@@ -256,8 +256,8 @@ csvql "SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS pick_min FR
 # Delivery time in days
 csvql "SELECT order_id, DATEDIFF('day', shipped_at, delivered_at) AS ship_days FROM 'orders.csv' WHERE shipped_at != '' AND delivered_at != '' ORDER BY ship_days DESC"
 
-# SLA check — select orders with pick time, then filter in your shell (DATEDIFF in WHERE not yet supported)
-csvql "SELECT order_id, customer_name, DATEDIFF('hour', ordered_at, picked_at) AS hrs FROM 'orders.csv' WHERE picked_at != ''"
+# SLA check — DATEDIFF, DATEADD and EXTRACT can be compared in WHERE (other scalar functions are SELECT-only for now)
+csvql "SELECT order_id, customer_name, DATEDIFF('hour', ordered_at, picked_at) AS hrs FROM 'orders.csv' WHERE DATEDIFF('hour', ordered_at, picked_at) > 2"
 
 # Average processing time by status
 csvql "SELECT status, AVG(DATEDIFF('minute', ordered_at, packaged_at)) AS avg_proc_min FROM 'orders.csv' WHERE packaged_at != '' GROUP BY status ORDER BY avg_proc_min"

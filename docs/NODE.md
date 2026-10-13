@@ -3,11 +3,13 @@
 csvql ships as a native Node.js addon — same SIMD engine, same performance, no subprocess.
 
 ```bash
-# 1. Build the native addon
-zig build node -Doptimize=ReleaseFast
-# → zig-out/lib/csvql.node
+npm install csvql-query
+```
 
-# 2. Run
+Prebuilt binaries for macOS, Linux and Windows ship in the package. To build the addon from this repository instead (Zig 0.15.2):
+
+```bash
+zig build node -Doptimize=ReleaseFast     # → zig-out/lib/csvql.node
 node nodejs/bench.js
 ```
 
