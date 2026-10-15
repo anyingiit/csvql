@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("simd.zig");
 const scalar = @import("scalar.zig");
+const datetime = @import("datetime.zig");
 const Allocator = std.mem.Allocator;
 
 /// Represents a comparison operator
@@ -261,6 +262,9 @@ pub const Query = struct {
     order_by: ?OrderBy,
     /// All JOIN clauses in order (empty slice when there is no JOIN).
     joins: []JoinClause,
+    /// The instant CURRENT_DATE, NOW() and CURRENT_TIMESTAMP resolve to, in
+    /// Unix seconds (UTC). Fixed at parse time so every row sees the same value.
+    now_ts: i64 = 0,
     allocator: Allocator,
 
     pub fn deinit(self: *Query) void {
@@ -555,8 +559,56 @@ fn splitCommaTerms(allocator: Allocator, input: []const u8) !std.ArrayList([]u8)
     return items;
 }
 
-/// Parse a SQL query string
+/// Replace CURRENT_DATE, CURRENT_TIMESTAMP and NOW() outside quotes with
+/// quoted literals for the instant `now_ts`, so WHERE, HAVING and the other
+/// clauses see an ordinary string value. Returns `text` itself when it holds
+/// none. The result is allocated from `allocator` (a scratch arena).
+fn resolveClockKeywords(allocator: Allocator, text: []const u8, now_ts: i64) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    var copied: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '\'' or c == '"') {
+            i += 1;
+            while (i < text.len and text[i] != c) : (i += 1) {}
+            if (i < text.len) i += 1;
+            continue;
+        }
+        const starts_word = (c == '_' or std.ascii.isAlphabetic(c)) and
+            (i == 0 or !(isAliasIdentChar(text[i - 1]) or text[i - 1] == '.'));
+        if (starts_word) {
+            if (datetime.matchClockKeyword(text[i..])) |m| {
+                const end = i + m.len;
+                if (end == text.len or !(isAliasIdentChar(text[end]) or text[end] == '.')) {
+                    var buf: [19]u8 = undefined;
+                    const lit = try datetime.formatClock(&buf, m.kind, now_ts);
+                    try out.appendSlice(allocator, text[copied..i]);
+                    try out.append(allocator, '\'');
+                    try out.appendSlice(allocator, lit);
+                    try out.append(allocator, '\'');
+                    copied = end;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if (copied == 0) return text;
+    try out.appendSlice(allocator, text[copied..]);
+    return out.items;
+}
+
+/// Parse a SQL query string. CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
+/// resolve to the current time (or `CSVQL_NOW`), read once here.
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
+    return parseAt(allocator, input, try datetime.queryInstant());
+}
+
+/// `parse` with the instant for CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
+/// given as Unix seconds (UTC) instead of read from the clock.
+pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
     // Every slice field starts as a valid empty slice (safe to free as a
     // no-op) rather than `undefined`, so the single errdefer below can call
     // query.deinit() from here on regardless of which fields have actually
@@ -575,6 +627,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         .offset = 0,
         .order_by = null,
         .joins = &.{},
+        .now_ts = now_ts,
         .allocator = allocator,
     };
     errdefer query.deinit();
@@ -638,7 +691,9 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
     // Extract file path (and optional JOIN clauses) from FROM clause.
     // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
-    const from_rest = trimmed[from_idx + 4 ..];
+    // The SELECT list keeps the keywords: scalar.zig resolves them there and
+    // the output column keeps the name the caller wrote.
+    const from_rest = try resolveClockKeywords(alias_scratch.allocator(), trimmed[from_idx + 4 ..], now_ts);
     var rest: []const u8 = undefined;
 
     // Reject unsupported JOIN types before they silently fall through to single-file mode.
@@ -2002,4 +2057,28 @@ test "parse distinct aggregate query" {
     try std.testing.expectEqual(@as(usize, 1), query.columns.len);
     try std.testing.expectEqualStrings("COUNT(*)", query.columns[0]);
     try std.testing.expectEqualStrings("data.csv", query.file_path);
+}
+
+test "resolveClockKeywords: replaces keywords outside quotes only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = try datetime.parseDateTime("2026-03-05 07:08:09");
+
+    try std.testing.expectEqualStrings(
+        "WHERE d >= '2026-03-05' AND t < '2026-03-05 07:08:09' OR u <= '2026-03-05 07:08:09'",
+        try resolveClockKeywords(a, "WHERE d >= current_date AND t < NOW() OR u <= Current_Timestamp()", ts),
+    );
+    // Quoted text, longer identifiers, qualified names and a bare `now` column are left alone.
+    const untouched = "WHERE a = 'now()' AND b = \"CURRENT_DATE\" AND current_dates > 1 AND my_now() > 1 AND t.now() > 1 AND now > 1";
+    try std.testing.expectEqualStrings(untouched, try resolveClockKeywords(a, untouched, ts));
+}
+
+test "parseAt: query keeps the instant it was parsed with" {
+    const ts = try datetime.parseDateTime("2026-03-05 07:08:09");
+    var q = try parseAt(std.testing.allocator, "SELECT id, NOW() FROM 'f.csv' WHERE d >= CURRENT_DATE", ts);
+    defer q.deinit();
+    try std.testing.expectEqual(ts, q.now_ts);
+    try std.testing.expectEqualStrings("NOW()", q.columns[1]);
+    try std.testing.expectEqualStrings("2026-03-05", q.where_expr.?.comparison.value);
 }

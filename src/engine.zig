@@ -293,6 +293,11 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
         // all, giving ColumnNotFound instead of the correct true/false value.
         if (std.ascii.indexOfIgnoreCase(e, " is null") != null or
             std.ascii.indexOfIgnoreCase(e, " is not null") != null) return true;
+        // CURRENT_DATE and CURRENT_TIMESTAMP have no parens either, and the
+        // size-routed paths cannot evaluate them (#202).
+        if (datetime.matchClockKeyword(e)) |m| {
+            if (m.len == e.len) return true;
+        }
         const open = std.mem.indexOf(u8, e, "(") orelse continue;
         const fn_raw = std.mem.trim(u8, e[0..open], &std.ascii.whitespace);
         // Skip empty (would be a syntax error anyway)
@@ -715,7 +720,7 @@ fn executeSequential(
             const expr = sa.expr;
 
             // Try scalar function first (UPPER, LOWER, TRIM, etc.)
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+            if (try scalar.tryParseScalarAt(expr, column_map, allocator, query.now_ts)) |parsed_spec| {
                 var sc_spec = parsed_spec;
                 {
                     errdefer sc_spec.deinit(allocator);
@@ -1292,7 +1297,7 @@ fn executeParallelScalar(
         for (query.columns) |col| {
             const sa = splitAlias(col);
             const expr = sa.expr;
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+            if (try scalar.tryParseScalarAt(expr, column_map, allocator, query.now_ts)) |parsed_spec| {
                 var sc_spec = parsed_spec;
                 {
                     errdefer sc_spec.deinit(allocator);
@@ -2277,7 +2282,7 @@ fn executeFromStdin(
             const expr = sa.expr;
 
             // Try scalar function first (UPPER, LOWER, TRIM, etc.)
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+            if (try scalar.tryParseScalarAt(expr, column_map, allocator, query.now_ts)) |parsed_spec| {
                 var sc_spec = parsed_spec;
                 {
                     errdefer sc_spec.deinit(allocator);
@@ -2976,6 +2981,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
             }
         },
         .is_null_check => |*a| a.col_idx = 0,
+        .clock => {},
         .concat => |*a| for (a.parts_buf[0..a.parts_len]) |*p| {
             if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
         },
@@ -5906,14 +5912,16 @@ fn executeGroupBy(
                     } else {
                         // Try scalar function applied to a plain GROUP BY column
                         // e.g. SELECT UPPER(city), COUNT(*) FROM x GROUP BY city
-                        if (try scalar.tryParseScalar(effective_col, column_map, allocator)) |parsed_spec| {
+                        if (try scalar.tryParseScalarAt(effective_col, column_map, allocator, query.now_ts)) |parsed_spec| {
                             var sc_spec = parsed_spec;
                             {
                                 errdefer sc_spec.deinit(allocator);
                                 // Find which group_spec slot contains this column
                                 const sc_col_idx = sc_spec.colIdx();
-                                var sc_gi: ?usize = null;
+                                // A clock keyword reads no column, so any key slot will do.
+                                var sc_gi: ?usize = if (sc_spec == .clock and group_specs.len > 0) 0 else null;
                                 for (group_specs, 0..) |spec, gi| {
+                                    if (sc_gi != null) break;
                                     if (spec == .column and spec.column == sc_col_idx) {
                                         sc_gi = gi;
                                         break;
@@ -10263,6 +10271,97 @@ test "GROUP BY: high-cardinality result is complete and in key order at any thre
         defer allocator.free(out);
         try std.testing.expect(std.mem.eql(u8, expected.written(), out));
     }
+}
+
+fn runAtInstant(allocator: Allocator, tmp: *std.testing.TmpDir, sql_fmt: []const u8, now_text: []const u8) ![]u8 {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("clock.csv", &pb);
+    const sql = try std.mem.replaceOwned(u8, allocator, sql_fmt, "{f}", p);
+    defer allocator.free(sql);
+    var q = try parser.parseAt(allocator, sql, try datetime.parseDateTime(now_text));
+    defer q.deinit();
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true, .truncate = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+    try out.seekTo(0);
+    return out.readToEndAlloc(allocator, 64 * 1024);
+}
+
+test "CURRENT_DATE, NOW and CURRENT_TIMESTAMP: SELECT list, header and value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("clock.csv", .{});
+        defer f.close();
+        try f.writeAll("id,created_at\n1,2026-03-04\n2,2026-03-05 08:00:00\n");
+    }
+    const data = try runAtInstant(
+        allocator,
+        &tmp,
+        "SELECT id, CURRENT_DATE, NOW() AS n, current_timestamp() FROM '{f}'",
+        "2026-03-05 07:08:09",
+    );
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings(
+        "id,CURRENT_DATE,n,current_timestamp()\n" ++
+            "1,2026-03-05,2026-03-05 07:08:09,2026-03-05 07:08:09\n" ++
+            "2,2026-03-05,2026-03-05 07:08:09,2026-03-05 07:08:09\n",
+        data,
+    );
+}
+
+test "CURRENT_DATE and NOW in WHERE compare against the pinned instant" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("clock.csv", .{});
+        defer f.close();
+        try f.writeAll("id,created_at,now\n1,2026-03-04,x\n2,2026-03-05,now()\n3,2026-03-05 08:00:00,y\n");
+    }
+    const since_today = try runAtInstant(allocator, &tmp, "SELECT id FROM '{f}' WHERE created_at >= CURRENT_DATE", "2026-03-05 07:08:09");
+    defer allocator.free(since_today);
+    try std.testing.expectEqualStrings("id\n2\n3\n", since_today);
+
+    const before_now = try runAtInstant(allocator, &tmp, "SELECT id FROM '{f}' WHERE created_at < NOW()", "2026-03-05 07:08:09");
+    defer allocator.free(before_now);
+    try std.testing.expectEqualStrings("id\n1\n2\n", before_now);
+
+    // The same query a day later sees a different instant.
+    const next_day = try runAtInstant(allocator, &tmp, "SELECT id FROM '{f}' WHERE created_at >= CURRENT_DATE", "2026-03-06 00:00:00");
+    defer allocator.free(next_day);
+    try std.testing.expectEqualStrings("id\n", next_day);
+
+    // Quoted text and a column that happens to be called `now` are not keywords.
+    const literal = try runAtInstant(allocator, &tmp, "SELECT id FROM '{f}' WHERE now = 'now()'", "2026-03-05 07:08:09");
+    defer allocator.free(literal);
+    try std.testing.expectEqualStrings("id\n2\n", literal);
+}
+
+test "NOW() in a GROUP BY query is the same value for every group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("clock.csv", .{});
+        defer f.close();
+        try f.writeAll("id,created_at\n1,a\n2,a\n3,b\n");
+    }
+    const data = try runAtInstant(
+        allocator,
+        &tmp,
+        "SELECT created_at, NOW(), COUNT(*) FROM '{f}' GROUP BY created_at ORDER BY created_at",
+        "2026-03-05 07:08:09",
+    );
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings("created_at,NOW(),COUNT(*)\na,2026-03-05 07:08:09,2\nb,2026-03-05 07:08:09,1\n", data);
+}
+
+test "bare CURRENT_DATE routes to the scalar path" {
+    var q = try parser.parseAt(std.testing.allocator, "SELECT id, CURRENT_DATE FROM 'f.csv'", 0);
+    defer q.deinit();
+    try std.testing.expect(hasScalarSelectFunctions(q));
 }
 
 test "REPEAT, POSITION and INSTR: SELECT list, nesting and GROUP BY" {

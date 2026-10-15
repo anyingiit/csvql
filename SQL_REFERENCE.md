@@ -56,6 +56,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
+| **CURRENT_DATE / NOW() / CURRENT_TIMESTAMP** | The current UTC date or time: `CURRENT_DATE` is `YYYY-MM-DD`, `NOW()` and `CURRENT_TIMESTAMP` are `YYYY-MM-DD HH:MM:SS`. The parentheses are optional on `CURRENT_DATE` and `CURRENT_TIMESTAMP` and required on `NOW()`, so a column called `now` still works. Usable in the `SELECT` list (the header is the text you wrote unless you give an alias) and as the value on the right of a `WHERE` comparison, e.g. `WHERE created_at >= CURRENT_DATE`. The clock is read once when the query is parsed, so every row, and a `col IN (SELECT ...)` subquery, sees the same instant. Set `CSVQL_NOW` to `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` (UTC) to pin it for scripts and tests; a value that does not parse is a query error. Not supported: arithmetic such as `CURRENT_DATE - 7`, `DATEADD`/`DATEDIFF` on the keywords (those take a column), and the keywords on the left of a `WHERE` comparison. Quoted text and longer identifiers such as `current_dates` are left alone, but a column named `current_date` cannot be selected unquoted |
 | **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, positional (`ORDER BY 1`), or a column not in the `SELECT` list (sorts by the raw source/grouping column) |
 | **LIMIT / OFFSET** | `LIMIT n [OFFSET m]` — return up to `n` rows after skipping the first `m` result rows |
 
@@ -275,6 +276,15 @@ csvql "SELECT order_id, shipped_at, DATEADD('day', 2, shipped_at) AS est_deliver
 # Supported units for both functions: second, minute, hour, day, week, month (approx 30 days), year (approx 365 days)
 csvql "SELECT order_id, DATEDIFF('second', ordered_at, picked_at) AS pick_secs FROM 'orders.csv'"
 csvql "SELECT order_id, DATEADD('week', -1, delivered_at) AS sent_reminder FROM 'orders.csv'"
+```
+
+```bash
+# Relative to now: the clock is fixed once per query
+csvql "SELECT COUNT(*) FROM 'events.csv' WHERE created_at >= CURRENT_DATE"
+csvql "SELECT id, NOW() AS queried_at FROM 'events.csv' LIMIT 5"
+
+# Pin the clock for a reproducible run
+CSVQL_NOW="2026-03-05 07:08:09" csvql "SELECT CURRENT_DATE, NOW() FROM 'events.csv' LIMIT 1"
 ```
 
 **Mixed formats work automatically** — a single CSV can have some dates as `2026-01-15 09:30:00`, others as `01/15/2026 08:00:00`, and `DATEDIFF` handles them all.

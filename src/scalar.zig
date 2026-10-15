@@ -4,7 +4,8 @@
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD, SQRT, POWER/POW, LN, LOG,
 ///           EXP, TRUNC, NULLIF, IFNULL,
-///           LTRIM, RTRIM, LEFT, RIGHT, REPEAT, POSITION, INSTR
+///           LTRIM, RTRIM, LEFT, RIGHT, REPEAT, POSITION, INSTR,
+///           CURRENT_DATE, NOW, CURRENT_TIMESTAMP
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -60,6 +61,7 @@ pub const ScalarSpec = union(enum) {
     nested: NestedArgs, // UPPER(TRIM(col)) etc — one level of function composition (#120)
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
     is_null_check: IsNullArgs, // col IS NULL / col IS NOT NULL as a SELECT expression
+    clock: []const u8, // CURRENT_DATE / NOW() / CURRENT_TIMESTAMP, resolved once per query (#202); owned
 
     pub const ReplaceArgs = struct {
         col_idx: usize,
@@ -261,6 +263,7 @@ pub const ScalarSpec = union(enum) {
                 if (p == .col_idx) break p.col_idx;
             } else 0,
             .nested => |a| a.inner.colIdx(),
+            .clock => 0,
         };
     }
 
@@ -272,6 +275,7 @@ pub const ScalarSpec = union(enum) {
                 inner.deinit(allocator);
                 allocator.destroy(inner);
             },
+            .clock => |text| allocator.free(text),
             else => {},
         }
     }
@@ -306,7 +310,27 @@ pub fn tryParseScalar(
     column_map: std.StringHashMap(usize),
     allocator: Allocator,
 ) !?ScalarSpec {
+    return tryParseScalarAt(expr, column_map, allocator, std.time.timestamp());
+}
+
+/// `tryParseScalar` with the instant CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
+/// resolve to, as Unix seconds (UTC). Queries pass `Query.now_ts` so every
+/// expression in one query sees the same instant.
+pub fn tryParseScalarAt(
+    expr: []const u8,
+    column_map: std.StringHashMap(usize),
+    allocator: Allocator,
+    now_ts: i64,
+) !?ScalarSpec {
     const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
+
+    if (datetime.matchClockKeyword(t)) |m| {
+        if (m.len == t.len) {
+            var buf: [19]u8 = undefined;
+            const text = try datetime.formatClock(&buf, m.kind, now_ts);
+            return .{ .clock = try allocator.dupe(u8, text) };
+        }
+    }
 
     // col IS NULL / col IS NOT NULL as a SELECT expression has no wrapping
     // parens either, so it must be checked before the paren-based dispatch.
@@ -373,7 +397,7 @@ pub fn tryParseScalar(
                 .length
             else
                 return error.NestedFunctionNotSupported;
-            var inner_spec = try tryParseScalar(args_str, column_map, allocator) orelse
+            var inner_spec = try tryParseScalarAt(args_str, column_map, allocator, now_ts) orelse
                 return error.ColumnNotFound;
             errdefer inner_spec.deinit(allocator);
             const inner_ptr = try allocator.create(ScalarSpec);
@@ -1022,6 +1046,7 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 .length => eval(.{ .length = 0 }, &inner_rec, arena),
             };
         },
+        .clock => |text| return text,
         .is_null_check => |args| {
             const is_null = field(record, args.col_idx).len == 0;
             const result = if (args.negate) !is_null else is_null;
@@ -2221,6 +2246,29 @@ test "GREATEST/LEAST: numeric and lexicographic" {
     try std.testing.expectEqualStrings("pear", eval(g, &.{ "apple", "pear" }, fba.allocator()));
     // single arg rejected
     try std.testing.expect((try tryParseScalar("GREATEST(a)", cm, allocator)) == null);
+}
+
+test "clock keywords resolve to a fixed instant, alone or nested" {
+    const allocator = std.testing.allocator;
+    var cm = std.StringHashMap(usize).init(allocator);
+    defer cm.deinit();
+    const ts = try datetime.parseDateTime("2026-03-05 07:08:09");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "CURRENT_DATE", .want = "2026-03-05" },
+        .{ .sql = "current_date()", .want = "2026-03-05" },
+        .{ .sql = "NOW()", .want = "2026-03-05 07:08:09" },
+        .{ .sql = "CURRENT_TIMESTAMP", .want = "2026-03-05 07:08:09" },
+        .{ .sql = "UPPER(NOW())", .want = "2026-03-05 07:08:09" },
+    };
+    for (cases) |c| {
+        var spec = (try tryParseScalarAt(c.sql, cm, allocator, ts)).?;
+        defer spec.deinit(allocator);
+        try std.testing.expectEqualStrings(c.want, eval(spec, &.{}, arena.allocator()));
+    }
+    try std.testing.expect((try tryParseScalarAt("NOW(1)", cm, allocator, ts)) == null);
 }
 
 test "REPEAT: counts, empty field, and the output cap" {

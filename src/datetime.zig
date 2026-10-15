@@ -464,6 +464,65 @@ pub fn formatDate(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     });
 }
 
+/// The SQL clock keywords. `date` is CURRENT_DATE, `timestamp` is NOW() and
+/// CURRENT_TIMESTAMP. Both are UTC.
+pub const ClockKind = enum { date, timestamp };
+
+pub const ClockMatch = struct { kind: ClockKind, len: usize };
+
+/// Match a clock keyword at the start of `s`: CURRENT_DATE, CURRENT_TIMESTAMP
+/// or NOW, each case-insensitive, with an optional `()` after it. NOW is only
+/// a keyword when it has the parentheses, so a column called `now` still works.
+/// `len` covers the whole match, parentheses included. The caller checks that
+/// the match is not part of a longer identifier.
+pub fn matchClockKeyword(s: []const u8) ?ClockMatch {
+    const names = [_]struct { name: []const u8, kind: ClockKind, needs_parens: bool }{
+        .{ .name = "current_timestamp", .kind = .timestamp, .needs_parens = false },
+        .{ .name = "current_date", .kind = .date, .needs_parens = false },
+        .{ .name = "now", .kind = .timestamp, .needs_parens = true },
+    };
+    for (names) |n| {
+        if (!std.ascii.startsWithIgnoreCase(s, n.name)) continue;
+        var end = n.name.len;
+        var i = end;
+        while (i < s.len and std.ascii.isWhitespace(s[i])) i += 1;
+        if (i < s.len and s[i] == '(') {
+            i += 1;
+            while (i < s.len and std.ascii.isWhitespace(s[i])) i += 1;
+            if (i < s.len and s[i] == ')') end = i + 1 else if (n.needs_parens) continue;
+        } else if (n.needs_parens) continue;
+        return .{ .kind = n.kind, .len = end };
+    }
+    return null;
+}
+
+/// Format `ts` as `YYYY-MM-DD` (date) or `YYYY-MM-DD HH:MM:SS` (timestamp).
+pub fn formatClock(buf: *[19]u8, kind: ClockKind, ts: i64) error{InvalidDate}![]const u8 {
+    const dt = DateTime.fromTimestamp(ts);
+    if (dt.year < 0 or dt.year > 9999) return error.InvalidDate;
+    const year: u32 = @intCast(dt.year);
+    return switch (kind) {
+        .date => std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, dt.month, dt.day }),
+        .timestamp => std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year, dt.month, dt.day, dt.hour, dt.minute, dt.second }),
+    } catch unreachable;
+}
+
+/// The instant a query sees as "now", in Unix seconds. It is read once per
+/// query. `CSVQL_NOW` (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, UTC) pins it so
+/// scripts and the correctness checks get the same answer every day.
+pub fn queryInstant() error{InvalidClockOverride}!i64 {
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const override = std.process.getEnvVarOwned(fba.allocator(), "CSVQL_NOW") catch |err| {
+        if (err == error.EnvironmentVariableNotFound) return std.time.timestamp();
+        return error.InvalidClockOverride;
+    };
+    const ts = parseDateTime(override) catch return error.InvalidClockOverride;
+    var check: [19]u8 = undefined;
+    _ = formatClock(&check, .timestamp, ts) catch return error.InvalidClockOverride;
+    return ts;
+}
+
 // Tests
 test "parse ISO-8601 date" {
     const ts = try parseDateTime("2026-01-15");
@@ -590,4 +649,29 @@ test "applyStrftime extracts the correct fields from US and EU formatted dates, 
 
     // Combined format string, EU date with a time component.
     try std.testing.expectEqualStrings("2026-01-25", applyStrftime("%Y-%m-%d", "25.01.2026 14:30:00", &buf));
+}
+
+test "matchClockKeyword: keywords, optional parentheses, NOW needs them" {
+    const t = std.testing;
+    try t.expectEqual(ClockKind.date, matchClockKeyword("CURRENT_DATE").?.kind);
+    try t.expectEqual(@as(usize, 14), matchClockKeyword("current_date()").?.len);
+    try t.expectEqual(@as(usize, 16), matchClockKeyword("current_date ( ) x").?.len);
+    try t.expectEqual(ClockKind.timestamp, matchClockKeyword("Current_Timestamp").?.kind);
+    try t.expectEqual(@as(usize, 5), matchClockKeyword("NOW()").?.len);
+    try t.expectEqual(@as(usize, 7), matchClockKeyword("now ( ) ").?.len);
+    try t.expect(matchClockKeyword("now") == null);
+    try t.expect(matchClockKeyword("now(1)") == null);
+    try t.expect(matchClockKeyword("nowhere()") == null);
+    try t.expect(matchClockKeyword("") == null);
+}
+
+test "formatClock: date and timestamp from a fixed instant" {
+    var buf: [19]u8 = undefined;
+    const ts = try parseDateTime("2026-03-05 07:08:09");
+    try std.testing.expectEqualStrings("2026-03-05", try formatClock(&buf, .date, ts));
+    try std.testing.expectEqualStrings("2026-03-05 07:08:09", try formatClock(&buf, .timestamp, ts));
+    // The last second of a day stays on that day: UTC, no rounding.
+    const late = try parseDateTime("2026-12-31 23:59:59");
+    try std.testing.expectEqualStrings("2026-12-31", try formatClock(&buf, .date, late));
+    try std.testing.expectError(error.InvalidDate, formatClock(&buf, .date, 300_000_000_000_000));
 }
